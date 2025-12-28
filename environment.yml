@@ -1,0 +1,19 @@
+# 系统镜像: lepton-trainingjob/nvidia24.04-ubuntu22.04-py3.10-cuda12.4-cudnn9.1-torch2.3.0-transformerengine1.5
+name: llm_final_pro
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+    - torch>=2.0.0
+    - torchtext>=0.15.0
+    - transformers>=4.40.0
+    - sentencepiece>=0.1.99
+    - jieba>=0.42.1
+    - tqdm>=4.66.0
+    - numpy>=1.24.0
+    - pyyaml>=6.0.0
+    - nltk>=3.8.1  # 用于BLEU评估（可选，但evaluate.py中可能需要）
+
