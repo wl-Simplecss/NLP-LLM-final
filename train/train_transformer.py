@@ -1,5 +1,10 @@
+"""
+Transformer NMT训练脚本 - 改进版
+添加BLEU评估、日志输出、测试集评估
+"""
 import argparse
 import os
+import sys
 import time
 from datetime import datetime, timedelta
 from typing import Tuple
@@ -8,12 +13,27 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-import sys
-import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from data_utils import load_jsonl, TranslationDataset, collate_fn, Vocab
+from data_utils import load_jsonl, TranslationDataset, collate_fn, Vocab, tokenize_en
 from models.models_transformer import TransformerNMT
+from run_mt_pipeline import bleu_compute_corpus_bleu
+
+
+class Logger:
+    """同时输出到控制台和日志文件"""
+    def __init__(self, log_path):
+        self.log_path = log_path
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        self.file = open(log_path, 'w', encoding='utf-8')
+    
+    def log(self, msg):
+        print(msg)
+        self.file.write(msg + '\n')
+        self.file.flush()
+    
+    def close(self):
+        self.file.close()
 
 
 def build_dataloaders(
@@ -21,39 +41,42 @@ def build_dataloaders(
     batch_size: int,
     max_len: int,
     use_small: bool,
-    use_spm: bool = True,
-) -> Tuple[DataLoader, DataLoader, Vocab, Vocab]:
+    use_spm: bool = False,
+) -> Tuple[DataLoader, DataLoader, DataLoader, object, object, list, list]:
     train_file = "train_10k.jsonl" if use_small else "train_100k.jsonl"
     train_path = os.path.join(data_dir, train_file)
     valid_path = os.path.join(data_dir, "valid.jsonl")
+    test_path = os.path.join(data_dir, "test.jsonl")
 
     train_data = load_jsonl(train_path)
     valid_data = load_jsonl(valid_path)
+    test_data = load_jsonl(test_path)
 
     train_ds = TranslationDataset(train_data, src_lang="zh", tgt_lang="en", max_len=max_len, use_spm=use_spm)
     valid_ds = TranslationDataset(
-        valid_data,
-        src_lang="zh",
-        tgt_lang="en",
-        max_len=max_len,
-        src_vocab=train_ds.src_vocab,
-        tgt_vocab=train_ds.tgt_vocab,
-        use_spm=use_spm,
+        valid_data, src_lang="zh", tgt_lang="en", max_len=max_len,
+        src_vocab=train_ds.src_vocab, tgt_vocab=train_ds.tgt_vocab, use_spm=use_spm,
+    )
+    test_ds = TranslationDataset(
+        test_data, src_lang="zh", tgt_lang="en", max_len=max_len,
+        src_vocab=train_ds.src_vocab, tgt_vocab=train_ds.tgt_vocab, use_spm=use_spm,
     )
 
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
     valid_loader = DataLoader(valid_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
-    return train_loader, valid_loader, train_ds.src_vocab, train_ds.tgt_vocab
+    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
+    
+    return train_loader, valid_loader, test_loader, train_ds.src_vocab, train_ds.tgt_vocab, valid_data, test_data
 
 
 def train_epoch(model, loader, criterion, optimizer, device, scheduler=None):
     model.train()
     total_loss = 0.0
-    for src, tgt, src_mask, tgt_mask in loader:
-        src, tgt, src_mask, tgt_mask = src.to(device), tgt.to(device), src_mask.to(device), tgt_mask.to(device)
+    for src, tgt, src_lengths, tgt_lengths, src_mask, tgt_mask in loader:
+        src, tgt = src.to(device), tgt.to(device)
+        src_mask = src_mask.to(device)
+        
         optimizer.zero_grad()
-
-        # shift target: input is [sos, ..., last-1], predict [first, ..., eos]
         tgt_inp = tgt[:, :-1]
         tgt_y = tgt[:, 1:]
 
@@ -66,6 +89,7 @@ def train_epoch(model, loader, criterion, optimizer, device, scheduler=None):
         if scheduler is not None:
             scheduler.step()
         total_loss += loss.item()
+    
     current_lr = scheduler.get_last_lr()[0] if scheduler is not None else optimizer.param_groups[0]['lr']
     return total_loss / len(loader), current_lr
 
@@ -74,8 +98,10 @@ def train_epoch(model, loader, criterion, optimizer, device, scheduler=None):
 def eval_epoch(model, loader, criterion, device):
     model.eval()
     total_loss = 0.0
-    for src, tgt, src_mask, tgt_mask in loader:
-        src, tgt, src_mask, tgt_mask = src.to(device), tgt.to(device), src_mask.to(device), tgt_mask.to(device)
+    for src, tgt, src_lengths, tgt_lengths, src_mask, tgt_mask in loader:
+        src, tgt = src.to(device), tgt.to(device)
+        src_mask = src_mask.to(device)
+        
         tgt_inp = tgt[:, :-1]
         tgt_y = tgt[:, 1:]
 
@@ -85,33 +111,113 @@ def eval_epoch(model, loader, criterion, device):
     return total_loss / len(loader)
 
 
+@torch.no_grad()
+def compute_bleu(model, loader, src_vocab, tgt_vocab, device, max_samples=500, max_len=128):
+    """计算BLEU分数"""
+    model.eval()
+    candidates = []
+    references = []
+    count = 0
+    
+    for src, tgt, src_lengths, tgt_lengths, src_mask, tgt_mask in loader:
+        src = src.to(device)
+        src_mask = src_mask.to(device)
+        
+        for i in range(src.size(0)):
+            if count >= max_samples:
+                break
+            
+            single_src = src[i:i+1]
+            single_mask = src_mask[i:i+1]
+            
+            # greedy decode
+            pred_ids = model.greedy_decode(single_src, single_mask, max_len=max_len)
+            pred_ids = pred_ids[0].cpu().tolist()
+            ref_ids = tgt[i].tolist()
+            
+            # 解码
+            if hasattr(tgt_vocab, 'decode_to_sentence'):
+                pred_str = tgt_vocab.decode_to_sentence(pred_ids)
+                ref_str = tgt_vocab.decode_to_sentence(ref_ids)
+            else:
+                pred_tokens = tgt_vocab.decode(pred_ids, remove_special=True)
+                ref_tokens_raw = tgt_vocab.decode(ref_ids, remove_special=True)
+                pred_str = ' '.join(pred_tokens)
+                ref_str = ' '.join(ref_tokens_raw)
+            
+            # 使用tokenize_en标准化
+            pred_tokens = tokenize_en(pred_str)
+            ref_tokens = tokenize_en(ref_str)
+            
+            candidates.append(pred_tokens)
+            references.append([ref_tokens])
+            count += 1
+        
+        if count >= max_samples:
+            break
+    
+    if not candidates:
+        return 0.0
+    
+    bleu_score = bleu_compute_corpus_bleu(candidates, references, max_n=4)
+    return bleu_score * 100
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", type=str, default="data_raw/AP0004_Midterm&Final_translation_dataset_zh_en")
-    parser.add_argument("--use_small", action="store_true", help="use 10k training set instead of 100k")
+    parser.add_argument("--use_small", action="store_true", help="use 10k training set")
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--max_len", type=int, default=128)
-    parser.add_argument("--d_model", type=int, default=512)  # 增加模型容量
-    parser.add_argument("--num_heads", type=int, default=8)  # 增加注意力头数
-    parser.add_argument("--num_encoder_layers", type=int, default=3)  # 减少层数到3，适合100k数据量
-    parser.add_argument("--num_decoder_layers", type=int, default=3)  # 减少层数到3，适合100k数据量
-    parser.add_argument("--dim_ff", type=int, default=2048)  # 增加FFN维度（通常是d_model的4倍）
-    parser.add_argument("--dropout", type=float, default=0.3)  # 提升dropout到0.3，防止过拟合
-    parser.add_argument("--use_spm", action="store_true", default=True, help="使用SentencePiece分词")
+    # 模型参数 - 最优配置
+    parser.add_argument("--d_model", type=int, default=256)
+    parser.add_argument("--num_heads", type=int, default=8)
+    parser.add_argument("--num_encoder_layers", type=int, default=4)
+    parser.add_argument("--num_decoder_layers", type=int, default=4)
+    parser.add_argument("--dim_ff", type=int, default=1024)
+    parser.add_argument("--dropout", type=float, default=0.2)  # 增加dropout减少过拟合
+    parser.add_argument("--use_spm", action="store_true", default=False)  # 默认使用Jieba分词
     parser.add_argument("--pos_encoding", type=str, default="sinusoidal", choices=["sinusoidal", "learned", "relative"])
-    parser.add_argument("--norm_type", type=str, default="layernorm", choices=["layernorm", "rmsnorm"])
-    parser.add_argument("--epochs", type=int, default=60)  # 增加到60轮，确保模型充分收敛
-    parser.add_argument("--warmup_steps", type=int, default=8000)  # 增加Warmup步数
-    parser.add_argument("--lr", type=float, default=1.0, help="Noam lr scale factor (peak lr≈lr*d_model^-0.5*warmup^-0.5)")
+    parser.add_argument("--norm_type", type=str, default="rmsnorm", choices=["layernorm", "rmsnorm"])  # RMSNorm效果更好
+    # 训练参数 - 充分训练
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--warmup_steps", type=int, default=4000)
+    parser.add_argument("--lr_scale", type=float, default=1.0)  # Noam学习率缩放系数
     parser.add_argument("--save_dir", type=str, default="checkpoints/checkpoints_transformer")
+    parser.add_argument("--log_dir", type=str, default="outputs")
+    parser.add_argument("--patience", type=int, default=15)
+    parser.add_argument("--eval_bleu_every", type=int, default=5)
     args = parser.parse_args()
 
     os.makedirs(args.save_dir, exist_ok=True)
+    os.makedirs(args.log_dir, exist_ok=True)
+    
+    # 创建日志
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = os.path.join(args.log_dir, f"transformer_training_{timestamp}.log")
+    logger = Logger(log_path)
+    
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    train_loader, valid_loader, src_vocab, tgt_vocab = build_dataloaders(
+    # 打印配置
+    logger.log("=" * 60)
+    logger.log("Transformer Training Configuration")
+    logger.log("=" * 60)
+    for k, v in vars(args).items():
+        logger.log(f"  {k}: {v}")
+    logger.log(f"  device: {device}")
+    logger.log("=" * 60)
+
+    train_loader, valid_loader, test_loader, src_vocab, tgt_vocab, valid_data, test_data = build_dataloaders(
         args.data_dir, args.batch_size, args.max_len, args.use_small, use_spm=args.use_spm
     )
+
+    logger.log(f"Train samples: {len(train_loader.dataset)}")
+    logger.log(f"Valid samples: {len(valid_loader.dataset)}")
+    logger.log(f"Test samples: {len(test_loader.dataset)}")
+    logger.log(f"Source vocab size: {len(src_vocab.itos)}")
+    logger.log(f"Target vocab size: {len(tgt_vocab.itos)}")
+    logger.log("=" * 60)
 
     model = TransformerNMT(
         src_vocab_size=len(src_vocab.itos),
@@ -127,89 +233,56 @@ def main():
         norm_type=args.norm_type,
     ).to(device)
 
-    # 使用Label Smoothing减少过拟合，提升泛化能力
-    criterion = nn.CrossEntropyLoss(ignore_index=0, label_smoothing=0.1)
-    # 添加weight_decay进行L2正则化，使用更标准的Adam参数
-    optimizer = torch.optim.Adam(model.parameters(), lr=1.0, betas=(0.9, 0.98), eps=1e-9, weight_decay=1e-4)
+    # 参数统计
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logger.log(f"Total parameters: {total_params:,}")
+    logger.log(f"Trainable parameters: {trainable_params:,}")
+    logger.log("=" * 60)
 
+    criterion = nn.CrossEntropyLoss(ignore_index=0, label_smoothing=0.1)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1.0, betas=(0.9, 0.98), eps=1e-9)
+
+    # Noam学习率调度
     def _noam_lambda(step: int):
         step = max(step, 1)
-        return args.lr * (args.d_model ** -0.5) * min(step ** -0.5, step * args.warmup_steps ** -1.5)
+        return args.lr_scale * (args.d_model ** -0.5) * min(step ** -0.5, step * args.warmup_steps ** -1.5)
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=_noam_lambda)
 
-    # 训练历史记录
-    train_losses = []
-    valid_losses = []
-    learning_rates = []
     best_valid_loss = float('inf')
+    best_bleu = 0.0
     best_epoch = 0
-    start_time = time.time()
-    patience = 15  # Early stopping patience (增加patience到15)
     no_improve_count = 0
-    
-    print("\n" + "="*80)
-    print("开始训练Transformer模型")
-    print("="*80)
-    print(f"模型配置:")
-    print(f"  - 模型维度 (d_model): {args.d_model}")
-    print(f"  - 注意力头数: {args.num_heads}")
-    print(f"  - 编码器层数: {args.num_encoder_layers}")
-    print(f"  - 解码器层数: {args.num_decoder_layers}")
-    print(f"  - 前馈网络维度: {args.dim_ff}")
-    print(f"  - 位置编码: {args.pos_encoding}")
-    print(f"  - 归一化类型: {args.norm_type}")
-    print(f"  - Batch Size: {args.batch_size}")
-    print(f"  - 最大长度: {args.max_len}")
-    print(f"  - 初始学习率: {args.lr}")
-    print(f"  - 总训练轮数: {args.epochs}")
-    print("="*80 + "\n")
+    start_time = time.time()
     
     for epoch in range(1, args.epochs + 1):
-        epoch_start_time = time.time()
-        
-        # 训练阶段（静默执行）
         train_loss, current_lr = train_epoch(model, train_loader, criterion, optimizer, device, scheduler)
-        train_losses.append(train_loss)
-        
-        # 验证阶段（静默执行）
         valid_loss = eval_epoch(model, valid_loader, criterion, device)
-        valid_losses.append(valid_loss)
         
-        # 更新学习率
-        learning_rates.append(current_lr)
+        elapsed = timedelta(seconds=int(time.time() - start_time))
         
-        # 计算epoch耗时
-        epoch_time = time.time() - epoch_start_time
+        # 计算BLEU
+        bleu_str = ""
+        if epoch % args.eval_bleu_every == 0 or epoch == 1:
+            bleu_score = compute_bleu(model, valid_loader, src_vocab, tgt_vocab, device, 
+                                       max_samples=min(300, len(valid_loader.dataset)), max_len=args.max_len)
+            bleu_str = f" | BLEU {bleu_score:.2f}"
+            if bleu_score > best_bleu:
+                best_bleu = bleu_score
         
-        # 损失变化
-        train_loss_change = ""
-        valid_loss_change = ""
-        if epoch > 1:
-            train_diff = train_loss - train_losses[-2]
-            valid_diff = valid_loss - valid_losses[-2]
-            train_loss_change = f" ({train_diff:+.4f})" if abs(train_diff) > 0.0001 else ""
-            valid_loss_change = f" ({valid_diff:+.4f})" if abs(valid_diff) > 0.0001 else ""
-        
-        # 检查是否是最佳模型
+        # 检查最佳模型
         is_best = valid_loss < best_valid_loss
+        best_mark = ""
         if is_best:
             best_valid_loss = valid_loss
             best_epoch = epoch
             no_improve_count = 0
-        else:
-            no_improve_count += 1
-        
-        # 精简输出：只显示关键结果
-        best_mark = " [BEST]" if is_best else ""
-        print(f"Epoch {epoch:3d}/{args.epochs} | Train Loss: {train_loss:.4f}{train_loss_change} | "
-              f"Valid Loss: {valid_loss:.4f}{valid_loss_change} | LR: {current_lr:.6f} | "
-              f"Time: {epoch_time:.1f}s{best_mark}")
-        
-        # 保存checkpoint（静默）
-        ckpt_path = os.path.join(args.save_dir, f"transformer_epoch{epoch}.pt")
-        torch.save(
-            {
+            best_mark = " [BEST]"
+            
+            # 保存最佳模型
+            best_path = os.path.join(args.save_dir, "best_transformer_model.pt")
+            torch.save({
                 "model_state": model.state_dict(),
                 "src_vocab": src_vocab,
                 "tgt_vocab": tgt_vocab,
@@ -217,34 +290,54 @@ def main():
                 "epoch": epoch,
                 "train_loss": train_loss,
                 "valid_loss": valid_loss,
-            },
-            ckpt_path,
-        )
+            }, best_path)
+        else:
+            no_improve_count += 1
         
-        # 每10个epoch显示训练趋势
-        if epoch % 10 == 0 or epoch == args.epochs:
-            print(f"\n训练趋势 (最近10个epoch):")
-            print(f"{'Epoch':<8} {'Train Loss':<12} {'Valid Loss':<12} {'LR':<12}")
-            print("-" * 50)
-            for i in range(max(0, epoch-10), epoch):
-                print(f"{i+1:<8} {train_losses[i]:<12.4f} {valid_losses[i]:<12.4f} {learning_rates[i]:<12.6f}")
-            print()
+        log_msg = f"Epoch {epoch:>3}/{args.epochs} | Train {train_loss:.4f} | Valid {valid_loss:.4f} | LR {current_lr:.6f}{bleu_str} | Elapsed {elapsed}{best_mark}"
+        logger.log(log_msg)
         
-        # Early stopping: 如果验证损失连续patience个epoch没有改善，提前停止
-        if no_improve_count >= patience:
-            print(f"\nEarly Stopping触发! 验证损失连续{patience}个epoch没有改善")
-            print(f"最佳模型: Epoch {best_epoch} (验证损失: {best_valid_loss:.4f})\n")
+        # 每20轮保存checkpoint
+        if epoch % 20 == 0:
+            ckpt_path = os.path.join(args.save_dir, f"transformer_epoch{epoch}.pt")
+            torch.save({
+                "model_state": model.state_dict(),
+                "src_vocab": src_vocab,
+                "tgt_vocab": tgt_vocab,
+                "args": vars(args),
+                "epoch": epoch,
+                "train_loss": train_loss,
+                "valid_loss": valid_loss,
+            }, ckpt_path)
+        
+        # Early stopping
+        if no_improve_count >= args.patience:
+            logger.log(f"Early stop at epoch {epoch}. Best epoch={best_epoch}, Best valid loss={best_valid_loss:.4f}")
             break
     
-    # 训练完成总结
-    total_time = time.time() - start_time
-    print(f"\n训练完成!")
-    print(f"总训练时间: {timedelta(seconds=int(total_time))}")
-    print(f"最佳模型: Epoch {best_epoch} (验证损失: {best_valid_loss:.4f})")
-    print(f"最终训练损失: {train_losses[-1]:.4f} | 最终验证损失: {valid_losses[-1]:.4f}\n")
+    # 测试集评估
+    logger.log("=" * 60)
+    logger.log("Training completed. Evaluating on test set...")
+    
+    # 加载最佳模型
+    best_ckpt = torch.load(os.path.join(args.save_dir, "best_transformer_model.pt"), map_location=device)
+    model.load_state_dict(best_ckpt["model_state"])
+    
+    test_loss = eval_epoch(model, test_loader, criterion, device)
+    test_bleu = compute_bleu(model, test_loader, src_vocab, tgt_vocab, device, 
+                              max_samples=len(test_loader.dataset), max_len=args.max_len)
+    
+    logger.log(f"Test Loss: {test_loss:.4f}")
+    logger.log(f"Test BLEU: {test_bleu:.2f}")
+    logger.log("=" * 60)
+    logger.log(f"Best epoch: {best_epoch}")
+    logger.log(f"Best valid loss: {best_valid_loss:.4f}")
+    logger.log(f"Best valid BLEU: {best_bleu:.2f}")
+    logger.log("=" * 60)
+    
+    logger.close()
+    print(f"\nTraining log saved to: {log_path}")
 
 
 if __name__ == "__main__":
     main()
-
-
